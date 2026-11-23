@@ -1,0 +1,496 @@
+name: Build fixed Tesa APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Get the Tesa source code
+        uses: actions/checkout@v4
+        with:
+          repository: terabyte25/tes3mp-android
+          ref: Tesa
+
+      - name: Java 17 (only for the Android SDK manager)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK 28
+        run: |
+          set -eu
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-28" "build-tools;28.0.3"
+
+      - name: Java 8 (for the old Gradle and Android plugin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Take native libraries and assets from the Tesa release APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          DL="$RUNNER_TEMP/dl"
+          mkdir -p "$DL/x"
+          gh release download Tesa --repo terabyte25/tes3mp-android --pattern '*.apk' --dir "$DL"
+          ls -la "$DL"
+          APK="$(ls -S "$DL"/*.apk | head -n 1)"
+          echo "Using $APK"
+          unzip -q "$APK" 'lib/*' 'assets/*' -d "$DL/x"
+          mkdir -p app/src/main/jniLibs app/src/main/assets
+          cp -r "$DL/x/lib/." app/src/main/jniLibs/
+          cp -r "$DL/x/assets/." app/src/main/assets/
+          test -f app/src/main/assets/libopenmw/resources/version
+          find app/src/main/jniLibs -name '*.so' | head -n 5
+
+      - name: Apply the fix
+        run: |
+          set -eu
+
+          cat > app/src/main/java/ui/fragments/FragmentSettings.kt <<'KOTLIN_EOF'
+          /*
+              Copyright (C) 2016 sandstranger
+              Copyright (C) 2018, 2019 Ilya Zhuravlev
+
+              This file is part of OpenMW-Android.
+
+              OpenMW-Android is free software: you can redistribute it and/or modify
+              it under the terms of the GNU General Public License as published by
+              the Free Software Foundation, either version 3 of the License, or
+              (at your option) any later version.
+
+              OpenMW-Android is distributed in the hope that it will be useful,
+              but WITHOUT ANY WARRANTY; without even the implied warranty of
+              MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+              GNU General Public License for more details.
+
+              You should have received a copy of the GNU General Public License
+              along with OpenMW-Android.  If not, see <https://www.gnu.org/licenses/>.
+          */
+
+          package ui.fragments
+
+          import android.Manifest
+          import android.app.AlertDialog
+          import android.content.DialogInterface
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.SharedPreferences.OnSharedPreferenceChangeListener
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.os.Environment
+          import android.preference.EditTextPreference
+          import android.preference.Preference
+          import android.preference.PreferenceFragment
+          import android.preference.PreferenceGroup
+          import android.widget.EditText
+          import androidx.core.content.ContextCompat
+
+          import com.libopenmw.openmw.R
+          import file.GameInstaller
+
+          import ui.activity.ConfigureControls
+          import ui.activity.ModsActivity
+          import ui.activity.BrowserActivity;
+          import java.io.File
+          import utils.MyApp
+          import java.util.*
+
+          class FragmentSettings : PreferenceFragment(), OnSharedPreferenceChangeListener {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  addPreferencesFromResource(R.xml.settings)
+                  preferenceScreen.sharedPreferences.registerOnSharedPreferenceChangeListener(this)
+
+                  findPreference("pref_controls").setOnPreferenceClickListener {
+                      val intent = Intent(activity, ConfigureControls::class.java)
+                      this.startActivity(intent)
+                      true
+                  }
+
+                  findPreference("pref_mods").setOnPreferenceClickListener {
+                      val intent = Intent(activity, ModsActivity::class.java)
+                      this.startActivity(intent)
+                      true
+                  }
+
+                  findPreference("pref_browser").setOnPreferenceClickListener {
+                      val intent = Intent(activity, BrowserActivity::class.java)
+                      this.startActivity(intent)
+                      true
+                  }
+
+                  findPreference("game_files").setOnPreferenceClickListener {
+                      if (ContextCompat.checkSelfPermission(activity,
+                              Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                          showError(R.string.permissions_error_title, R.string.permissions_error_message)
+                      } else {
+                          // The old StorageChooser library crashes on recent Android versions,
+                          // so a simple built-in folder browser is used instead.
+                          val saved = preferenceScreen.sharedPreferences.getString("game_files", "") ?: ""
+                          var start = File(saved)
+                          if (saved.isEmpty() || !start.isDirectory)
+                              start = Environment.getExternalStorageDirectory()
+                          browseFolder(start)
+                      }
+                      true
+                  }
+              }
+
+              /**
+               * Checks the specified path for a valid morrowind installation, generates config files
+               * and saves the path to shared prefs if it's valid.
+               * If it isn't, an error is displayed to the user.
+               */
+              private fun setupData(path: String) {
+                  val sharedPref = preferenceScreen.sharedPreferences
+
+                  // reset the setting so that it's erased on error instead of keeping
+                  // possibly stale value
+                  var gameFiles = ""
+
+                  try {
+                      val inst = GameInstaller(path)
+                      if (inst.check()) {
+                          inst.setNomedia()
+                          if (!inst.convertIni(sharedPref.getString("pref_encoding", GameInstaller.DEFAULT_CHARSET_PREF)!!)) {
+                              showError(R.string.data_error_title, R.string.ini_error_message)
+                          } else {
+                              gameFiles = path
+                          }
+                      } else {
+                          showError(R.string.data_error_title, R.string.data_error_message)
+                      }
+                  } catch (e: Exception) {
+                      // e.g. the folder can't be read: report it instead of crashing
+                      showError(R.string.data_error_title, R.string.data_error_message)
+                  }
+
+                  with(sharedPref.edit()) {
+                      putString("game_files", gameFiles)
+                      apply()
+                  }
+              }
+
+              /**
+               * Shows a simple folder browser. The user opens folders from the list and
+               * confirms the current folder with "Select this folder".
+               */
+              private fun browseFolder(dir: File) {
+                  val subDirs = (dir.listFiles() ?: emptyArray<File>())
+                      .filter { it.isDirectory && !it.name.startsWith(".") }
+                      .sortedBy { it.name.toLowerCase(Locale.ROOT) }
+
+                  val parent: File? = dir.parentFile
+                  val targets = ArrayList<File>()
+                  val labels = ArrayList<String>()
+                  if (parent != null) {
+                      targets.add(parent)
+                      labels.add("..")
+                  }
+                  for (sub in subDirs) {
+                      targets.add(sub)
+                      labels.add(sub.name)
+                  }
+
+                  val title = if (dir.canRead()) dir.absolutePath else dir.absolutePath + " (cannot read)"
+
+                  AlertDialog.Builder(activity)
+                      .setTitle(title)
+                      .setItems(labels.toTypedArray()) { _: DialogInterface, which: Int ->
+                          browseFolder(targets[which])
+                      }
+                      .setPositiveButton("Select this folder") { _: DialogInterface, _: Int ->
+                          setupData(dir.absolutePath)
+                      }
+                      .setNeutralButton("Type path") { _: DialogInterface, _: Int -> askForPath() }
+                      .setNegativeButton(android.R.string.cancel) { _: DialogInterface, _: Int -> }
+                      .show()
+              }
+
+              /**
+               * Lets the user type the path of the Morrowind folder by hand
+               */
+              private fun askForPath() {
+                  val input = EditText(activity)
+                  input.setSingleLine()
+                  input.setText(Environment.getExternalStorageDirectory().absolutePath + "/")
+
+                  AlertDialog.Builder(activity)
+                      .setTitle("Path to the Morrowind folder")
+                      .setView(input)
+                      .setPositiveButton(android.R.string.ok) { _: DialogInterface, _: Int ->
+                          setupData(input.text.toString().trim())
+                      }
+                      .setNegativeButton(android.R.string.cancel) { _: DialogInterface, _: Int -> }
+                      .show()
+              }
+
+              /**
+               * Shows an alert dialog displaying a specific error
+               * @param title Title string resource
+               * @param message Message string resource
+               */
+              private fun showError(title: Int, message: Int) {
+                  AlertDialog.Builder(activity)
+                      .setTitle(title)
+                      .setMessage(message)
+                      .setPositiveButton(android.R.string.ok) { _: DialogInterface, _: Int -> }
+                      .show()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  for (i in 0 until preferenceScreen.preferenceCount) {
+                      val preference = preferenceScreen.getPreference(i)
+                      if (preference is PreferenceGroup) {
+                          for (j in 0 until preference.preferenceCount) {
+                              val singlePref = preference.getPreference(j)
+                              updatePreference(singlePref, singlePref.key)
+                          }
+                      } else {
+                          updatePreference(preference, preference.key)
+                      }
+                  }
+              }
+
+              override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences, key: String) {
+                  updatePreference(findPreference(key), key)
+              }
+
+              private fun updatePreference(preference: Preference?, key: String) {
+                  if (preference == null)
+                      return
+                  if (preference is EditTextPreference) {
+                      if (key == "pref_uiScaling" && (preference.text == null || preference.text.isEmpty()))
+                          // Show "Auto (1.23)"
+                          preference.summary = MyApp.app.getString(R.string.uiScaling_auto)
+                              .format(Locale.ROOT, MyApp.app.defaultScaling)
+                      else
+                          preference.summary = preference.text
+                  }
+                  // Show selected value as a summary for game_files
+                  if (key == "game_files") {
+                      preference.summary = preference.sharedPreferences.getString("game_files", "")
+                  }
+              }
+
+          }
+          KOTLIN_EOF
+
+          cat > app/src/main/java/file/GameInstaller.kt <<'KOTLIN_EOF'
+          /*
+              Copyright (C) 2019 Ilya Zhuravlev
+
+              This file is part of OpenMW-Android.
+
+              OpenMW-Android is free software: you can redistribute it and/or modify
+              it under the terms of the GNU General Public License as published by
+              the Free Software Foundation, either version 3 of the License, or
+              (at your option) any later version.
+
+              OpenMW-Android is distributed in the hope that it will be useful,
+              but WITHOUT ANY WARRANTY; without even the implied warranty of
+              MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+              GNU General Public License for more details.
+
+              You should have received a copy of the GNU General Public License
+              along with OpenMW-Android.  If not, see <https://www.gnu.org/licenses/>.
+          */
+
+          package file
+
+          import android.content.Context
+          import android.preference.PreferenceManager
+          import constants.Constants
+          import java.io.File
+          import java.io.IOException
+          import java.nio.charset.Charset
+
+          /**
+           * Class responsible for initial game setup which involves
+           * transforming morrowind.ini into openmw.cfg
+           */
+          class GameInstaller(path: String) {
+
+              val dir = File(path)
+
+              /**
+               * Lists the root directory and finds a file or directory named "name",
+               * doing case-insensitive checks
+               * @param name Name to search
+               * @return File object if it was found, null otherwise
+               */
+              private fun findCaseInsensitive(name: String): File? {
+                  val nameLower = name.toLowerCase()
+                  // list() returns null when the directory can't be read (e.g. no storage
+                  // access on newer Android versions); treat that as "not found"
+                  val matches = dir.list { _, fileName -> fileName.toLowerCase() == nameLower }
+                      ?: return null
+                  return matches
+                      .map { File(dir, it) }
+                      .firstOrNull()
+              }
+
+              /**
+               * Checks that the "path" directory contains a morrowind.ini,
+               * and that there's a "Data Files" directory
+               */
+              fun check(): Boolean {
+                  // Root directory must exist and be a directory
+                  if (!dir.exists() || !dir.isDirectory)
+                      return false
+
+                  // morrowind.ini as well as data files must exist
+                  return findCaseInsensitive(INI_NAME) != null
+                      && findCaseInsensitive(DATA_NAME) != null
+              }
+
+              /**
+               * Returns path to the Data Files directory as a string
+               */
+              fun findDataFiles(): String {
+                  return File(dir, DATA_NAME).absolutePath
+              }
+
+              /**
+               * Adds a .nomedia to the game folder so that it doesn't bloat up the gallery
+               * If this fails, then who cares
+               */
+              fun setNomedia() {
+                  try {
+                      val file = File(dir, ".nomedia")
+                      if (!file.exists())
+                          file.createNewFile()
+                  } catch (e: IOException) {
+                  }
+              }
+
+              /**
+               * Converts morrowind.ini into openmw format and places it into our resources directory
+               * (properly named and everything)
+               * @param encoding Game encoding as entered by the user; one of pref_encoding_values
+               * @return Whether the conversion succeeded
+               */
+              fun convertIni(encoding: String): Boolean {
+                  val file = findCaseInsensitive(INI_NAME) ?: return false
+
+                  val charset = when (encoding) {
+                      "win1250" -> Charset.forName("windows-1250")
+                      "win1251" -> Charset.forName("windows-1251")
+                      else -> Charset.forName("windows-1252")
+                  }
+
+                  val contents = file.readText(charset)
+                  if (contents.isEmpty())
+                      return false
+
+                  val ini = IniConverter(contents)
+                  val output = ini.convert()
+                  // there's gotta be something in the output as well
+                  if (output.isEmpty())
+                      return false
+
+                  File(File(Constants.OPENMW_FALLBACK_CFG).parent).mkdirs()
+                  File(Constants.OPENMW_FALLBACK_CFG).writeText(output)
+
+                  return true
+              }
+
+              companion object {
+                  const val INI_NAME = "Morrowind.ini"
+                  const val DATA_NAME = "Data Files"
+                  const val DEFAULT_CHARSET_PREF = "win1252"
+
+                  /**
+                   * Returns path of Data Files, making use of path to the game from the settings
+                   * @param ctx Android context
+                   * @return Absolute path to data files as a string
+                   */
+                  fun getDataFiles(ctx: Context): String {
+                      val gamePath = PreferenceManager.getDefaultSharedPreferences(ctx)
+                          .getString("game_files", "")!!
+                      val inst = GameInstaller(gamePath)
+                      return inst.findDataFiles()
+                  }
+              }
+
+          }
+          KOTLIN_EOF
+
+          # MainActivity: drop the unused AppUpdater imports (that dependency is removed below)
+          sed -i '/^import com\.github\.javiersantos\.appupdater/d' app/src/main/java/ui/activity/MainActivity.kt
+
+          # Gradle files: drop the two dependencies that are no longer used and
+          # prefer Maven Central, because the old JCenter is no longer reliable
+          python3 -I - <<'PY'
+          import pathlib
+
+          def edit(path, pairs):
+              p = pathlib.Path(path)
+              s = p.read_text()
+              for old, new in pairs:
+                  if s.count(old) != 1:
+                      raise SystemExit("anchor not found once in %s: %r" % (path, old))
+                  s = s.replace(old, new)
+              p.write_text(s)
+
+          edit("build.gradle", [
+              ("""    repositories {
+                  jcenter()
+                  google()
+                  maven {
+                      url 'https://maven.google.com/'
+                      name 'Google'
+                  }
+              }""", """    repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+                  jcenter()
+              }"""),
+              ("""        google()
+                  maven { url "https://jitpack.io" }
+          """, """        google()
+                  mavenCentral()
+          """),
+          ])
+
+          edit("app/build.gradle", [
+              ("    implementation 'com.github.codekidX:storage-chooser:2.0.4.4'\n\n", ""),
+              ("    implementation 'com.github.javiersantos:AppUpdater:2.7'\n\n", ""),
+              ("""repositories {
+              jcenter()
+              maven {
+                  url "https://jitpack.io"
+              }
+          }""", """repositories {
+              mavenCentral()
+              jcenter()
+          }"""),
+              ("    compileSdkVersion 28\n",
+               "    compileSdkVersion 28\n\n    packagingOptions {\n        pickFirst '**/*.so'\n    }\n"),
+          ])
+          PY
+
+      - name: Build the APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleMainlineDebug --stacktrace
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tesa-fixed-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
