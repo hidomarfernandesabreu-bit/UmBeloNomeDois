@@ -1,0 +1,526 @@
+name: Build fixed Tesa APK
+
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Get the Tesa source code
+        uses: actions/checkout@v4
+        with:
+          repository: terabyte25/tes3mp-android
+          ref: Tesa
+
+      - name: Java 17 (only for the Android SDK manager)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK 28
+        run: |
+          set -eu
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-28" "build-tools;28.0.3"
+
+      - name: Java 8 (for the old Gradle and Android plugin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Take native libraries and assets from the Tesa release APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          DL="$RUNNER_TEMP/dl"
+          mkdir -p "$DL/x"
+          gh release download Tesa --repo terabyte25/tes3mp-android --pattern '*.apk' --dir "$DL"
+          ls -la "$DL"
+          APK="$(ls -S "$DL"/*.apk | head -n 1)"
+          echo "Using $APK"
+          unzip -q "$APK" 'lib/*' 'assets/*' -d "$DL/x"
+          mkdir -p app/src/main/jniLibs app/src/main/assets
+          cp -r "$DL/x/lib/." app/src/main/jniLibs/
+          cp -r "$DL/x/assets/." app/src/main/assets/
+          test -f app/src/main/assets/libopenmw/resources/version
+          find app/src/main/jniLibs -name '*.so' | head -n 5
+
+      - name: Add a small replacement for the Anko library
+        run: |
+          set -eu
+          mkdir -p app/src/main/java/org/jetbrains/anko/db
+
+          cat > app/src/main/java/org/jetbrains/anko/db/AnkoDb.kt <<'KOTLIN_EOF'
+          /*
+              Minimal replacement for the parts of the Anko library (org.jetbrains.anko.db)
+              that this app uses. Anko is no longer available from any online repository.
+          */
+
+          package org.jetbrains.anko.db
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.database.Cursor
+          import android.database.sqlite.SQLiteDatabase
+          import android.database.sqlite.SQLiteException
+          import android.database.sqlite.SQLiteOpenHelper
+
+          class SqlType(val name: String)
+
+          val INTEGER = SqlType("INTEGER")
+          val TEXT = SqlType("TEXT")
+
+          interface RowParser<out T> {
+              fun parseRow(columns: Array<Any?>): T
+          }
+
+          object IntParser : RowParser<Int> {
+              override fun parseRow(columns: Array<Any?>): Int = (columns[0] as Number).toInt()
+          }
+
+          abstract class ManagedSQLiteOpenHelper(
+              ctx: Context,
+              name: String,
+              factory: SQLiteDatabase.CursorFactory? = null,
+              version: Int = 1
+          ) : SQLiteOpenHelper(ctx, name, factory, version) {
+
+              private var openCount = 0
+              private var database: SQLiteDatabase? = null
+
+              fun <T> use(f: SQLiteDatabase.() -> T): T {
+                  try {
+                      return openDatabase().f()
+                  } finally {
+                      closeDatabase()
+                  }
+              }
+
+              @Synchronized
+              private fun openDatabase(): SQLiteDatabase {
+                  openCount += 1
+                  if (openCount == 1)
+                      database = writableDatabase
+                  return database!!
+              }
+
+              @Synchronized
+              private fun closeDatabase() {
+                  openCount -= 1
+                  if (openCount == 0)
+                      database?.close()
+              }
+          }
+
+          // ---------------------------------------------------------------- helpers
+
+          /**
+           * Replaces {name} placeholders in a where clause with the (escaped) values given
+           */
+          internal fun applyArguments(clause: String, vararg args: Pair<String, Any>): String {
+              val values = HashMap<String, Any>()
+              for (arg in args)
+                  values[arg.first] = arg.second
+
+              return Regex("\\{([^{}]+)\\}").replace(clause) { match ->
+                  val key = match.groupValues[1]
+                  val value = values[key] ?: throw IllegalStateException("Can't find a value for key " + key)
+                  when (value) {
+                      is Boolean -> if (value) "1" else "0"
+                      is Number -> value.toString()
+                      else -> "'" + value.toString().replace("'", "''") + "'"
+                  }
+              }
+          }
+
+          internal fun Array<out Pair<String, Any?>>.toContentValues(): ContentValues {
+              val values = ContentValues()
+              for ((key, value) in this) {
+                  when (value) {
+                      null -> values.putNull(key)
+                      is Boolean -> values.put(key, value)
+                      is Byte -> values.put(key, value)
+                      is Short -> values.put(key, value)
+                      is Int -> values.put(key, value)
+                      is Long -> values.put(key, value)
+                      is Float -> values.put(key, value)
+                      is Double -> values.put(key, value)
+                      is String -> values.put(key, value)
+                      is ByteArray -> values.put(key, value)
+                      else -> throw IllegalArgumentException("Non-supported value type " + value.javaClass.name)
+                  }
+              }
+              return values
+          }
+
+          // ---------------------------------------------------------------- schema
+
+          fun SQLiteDatabase.createTable(tableName: String, ifNotExists: Boolean = false,
+                                         vararg columns: Pair<String, SqlType>) {
+              val exists = if (ifNotExists) "IF NOT EXISTS " else ""
+              val cols = columns.joinToString(", ") { it.first + " " + it.second.name }
+              execSQL("CREATE TABLE " + exists + "`" + tableName + "`(" + cols + ");")
+          }
+
+          fun SQLiteDatabase.createIndex(indexName: String, tableName: String, unique: Boolean = false,
+                                         ifNotExists: Boolean = false, vararg columns: String) {
+              val kind = if (unique) "UNIQUE " else ""
+              val exists = if (ifNotExists) "IF NOT EXISTS " else ""
+              execSQL("CREATE " + kind + "INDEX " + exists + "`" + indexName + "` ON `" + tableName +
+                      "`(" + columns.joinToString(", ") + ");")
+          }
+
+          // ---------------------------------------------------------------- queries
+
+          fun SQLiteDatabase.insert(tableName: String, vararg values: Pair<String, Any?>): Long {
+              return insert(tableName, null, values.toContentValues())
+          }
+
+          fun SQLiteDatabase.delete(tableName: String, whereClause: String,
+                                    vararg args: Pair<String, Any>): Int {
+              return delete(tableName, applyArguments(whereClause, *args), null)
+          }
+
+          class UpdateQueryBuilder(private val db: SQLiteDatabase,
+                                   private val table: String,
+                                   private val values: ContentValues) {
+              private var selection: String? = null
+
+              fun whereArgs(select: String, vararg args: Pair<String, Any>): UpdateQueryBuilder {
+                  selection = applyArguments(select, *args)
+                  return this
+              }
+
+              fun exec(): Int = db.update(table, values, selection, null)
+          }
+
+          fun SQLiteDatabase.update(tableName: String, vararg values: Pair<String, Any?>): UpdateQueryBuilder {
+              return UpdateQueryBuilder(this, tableName, values.toContentValues())
+          }
+
+          class SelectQueryBuilder(private val db: SQLiteDatabase,
+                                   private val table: String,
+                                   private val columns: Array<String>) {
+              private var selection: String? = null
+
+              fun whereArgs(select: String, vararg args: Pair<String, Any>): SelectQueryBuilder {
+                  selection = applyArguments(select, *args)
+                  return this
+              }
+
+              fun <T> exec(f: Cursor.() -> T): T {
+                  val cursor = db.query(table, columns, selection, null, null, null, null)
+                  try {
+                      return cursor.f()
+                  } finally {
+                      cursor.close()
+                  }
+              }
+          }
+
+          fun SQLiteDatabase.select(tableName: String, vararg columns: String): SelectQueryBuilder {
+              return SelectQueryBuilder(this, tableName, arrayOf(*columns))
+          }
+
+          fun <T> SQLiteDatabase.transaction(code: SQLiteDatabase.() -> T): T {
+              beginTransaction()
+              try {
+                  val result = code()
+                  setTransactionSuccessful()
+                  return result
+              } finally {
+                  endTransaction()
+              }
+          }
+
+          // ---------------------------------------------------------------- cursor parsing
+
+          private fun Cursor.readRow(): Array<Any?> {
+              return Array<Any?>(columnCount) { i ->
+                  when (getType(i)) {
+                      Cursor.FIELD_TYPE_INTEGER -> getLong(i)
+                      Cursor.FIELD_TYPE_FLOAT -> getDouble(i)
+                      Cursor.FIELD_TYPE_STRING -> getString(i)
+                      Cursor.FIELD_TYPE_BLOB -> getBlob(i)
+                      else -> null
+                  }
+              }
+          }
+
+          fun <T> Cursor.parseSingle(parser: RowParser<T>): T {
+              if (count != 1)
+                  throw SQLiteException("parseSingle accepts only cursors with a single entry")
+              moveToFirst()
+              return parser.parseRow(readRow())
+          }
+
+          fun <T> Cursor.parseList(parser: RowParser<T>): List<T> {
+              val list = ArrayList<T>(count)
+              moveToFirst()
+              while (!isAfterLast) {
+                  list.add(parser.parseRow(readRow()))
+                  moveToNext()
+              }
+              return list
+          }
+          KOTLIN_EOF
+
+          cat > app/src/main/java/org/jetbrains/anko/DefaultSharedPreferences.kt <<'KOTLIN_EOF'
+          /*
+              Minimal replacement for the one function of the Anko library (org.jetbrains.anko)
+              that this app uses. Anko is no longer available from any online repository.
+          */
+
+          package org.jetbrains.anko
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.preference.PreferenceManager
+
+          val Context.defaultSharedPreferences: SharedPreferences
+              get() = PreferenceManager.getDefaultSharedPreferences(this)
+          KOTLIN_EOF
+
+      - name: Apply the fix
+        run: |
+          set -eu
+          python3 -I - <<'PY'
+          import pathlib
+          import re
+
+
+          def edit(path, pairs):
+              """Replace text in a file. Every anchor must be found exactly once."""
+              p = pathlib.Path(path)
+              s = p.read_text()
+              for old, new in pairs:
+                  if s.count(old) != 1:
+                      raise SystemExit("Anchor not found exactly once in %s:\n%s" % (path, old))
+                  s = s.replace(old, new)
+              p.write_text(s)
+
+
+          JAVA = "app/src/main/java/"
+
+          # ---------------------------------------------------------------- folder picker
+          OLD_CHOOSER = """                val chooser = StorageChooser.Builder()
+                              .withActivity(activity)
+                              .withFragmentManager(fragmentManager)
+                              .withMemoryBar(true)
+                              .allowCustomPath(true)
+                              .setType(StorageChooser.DIRECTORY_CHOOSER)
+                              .build()
+
+                          chooser.show()
+
+                          chooser.setOnSelectListener { path -> setupData(path) }
+          """
+          NEW_CHOOSER = """                // The old StorageChooser library crashes on recent Android versions,
+                          // so a simple built-in folder browser is used instead.
+                          val saved = preferenceScreen.sharedPreferences.getString("game_files", "") ?: ""
+                          var start = File(saved)
+                          if (saved.isEmpty() || !start.isDirectory)
+                              start = Environment.getExternalStorageDirectory()
+                          browseFolder(start)
+          """
+
+          OLD_SETUP = """        val inst = GameInstaller(path)
+                  if (inst.check()) {
+                      inst.setNomedia()
+                      if (!inst.convertIni(sharedPref.getString("pref_encoding", GameInstaller.DEFAULT_CHARSET_PREF)!!)) {
+                          showError(R.string.data_error_title, R.string.ini_error_message)
+                      } else {
+                          gameFiles = path
+                      }
+                  } else {
+                      showError(R.string.data_error_title, R.string.data_error_message)
+                  }
+          """
+          NEW_SETUP = """        try {
+                      val inst = GameInstaller(path)
+                      if (inst.check()) {
+                          inst.setNomedia()
+                          if (!inst.convertIni(sharedPref.getString("pref_encoding", GameInstaller.DEFAULT_CHARSET_PREF)!!)) {
+                              showError(R.string.data_error_title, R.string.ini_error_message)
+                          } else {
+                              gameFiles = path
+                          }
+                      } else {
+                          showError(R.string.data_error_title, R.string.data_error_message)
+                      }
+                  } catch (e: Exception) {
+                      // e.g. the folder can't be read: report it instead of crashing
+                      showError(R.string.data_error_title, R.string.data_error_message)
+                  }
+          """
+
+          ANCHOR_SHOWERR = "    /**\n     * Shows an alert dialog displaying a specific error\n"
+          NEW_FUNCS = """    /**
+               * Shows a simple folder browser. The user opens folders from the list and
+               * confirms the current folder with "Select this folder".
+               */
+              private fun browseFolder(dir: File) {
+                  val subDirs = (dir.listFiles() ?: emptyArray<File>())
+                      .filter { it.isDirectory && !it.name.startsWith(".") }
+                      .sortedBy { it.name.toLowerCase(Locale.ROOT) }
+
+                  val parent: File? = dir.parentFile
+                  val targets = ArrayList<File>()
+                  val labels = ArrayList<String>()
+                  if (parent != null) {
+                      targets.add(parent)
+                      labels.add("..")
+                  }
+                  for (sub in subDirs) {
+                      targets.add(sub)
+                      labels.add(sub.name)
+                  }
+
+                  val title = if (dir.canRead()) dir.absolutePath else dir.absolutePath + " (cannot read)"
+
+                  AlertDialog.Builder(activity)
+                      .setTitle(title)
+                      .setItems(labels.toTypedArray()) { _: DialogInterface, which: Int ->
+                          browseFolder(targets[which])
+                      }
+                      .setPositiveButton("Select this folder") { _: DialogInterface, _: Int ->
+                          setupData(dir.absolutePath)
+                      }
+                      .setNeutralButton("Type path") { _: DialogInterface, _: Int -> askForPath() }
+                      .setNegativeButton(android.R.string.cancel) { _: DialogInterface, _: Int -> }
+                      .show()
+              }
+
+              /**
+               * Lets the user type the path of the Morrowind folder by hand
+               */
+              private fun askForPath() {
+                  val input = EditText(activity)
+                  input.setSingleLine()
+                  input.setText(Environment.getExternalStorageDirectory().absolutePath + "/")
+
+                  AlertDialog.Builder(activity)
+                      .setTitle("Path to the Morrowind folder")
+                      .setView(input)
+                      .setPositiveButton(android.R.string.ok) { _: DialogInterface, _: Int ->
+                          setupData(input.text.toString().trim())
+                      }
+                      .setNegativeButton(android.R.string.cancel) { _: DialogInterface, _: Int -> }
+                      .show()
+              }
+
+          """
+
+          edit(JAVA + "ui/fragments/FragmentSettings.kt", [
+              ("import android.os.Bundle\n", "import android.os.Bundle\nimport android.os.Environment\n"),
+              ("import android.preference.PreferenceGroup\n",
+               "import android.preference.PreferenceGroup\nimport android.widget.EditText\n"),
+              ("import com.codekidlabs.storagechooser.StorageChooser\n", ""),
+              (OLD_CHOOSER, NEW_CHOOSER),
+              (OLD_SETUP, NEW_SETUP),
+              (ANCHOR_SHOWERR, NEW_FUNCS + ANCHOR_SHOWERR),
+          ])
+
+          # ---------------------------------------------------------------- unreadable folder
+          edit(JAVA + "file/GameInstaller.kt", [
+              ("""        return dir
+                      .list { _, fileName -> fileName.toLowerCase() == nameLower }
+                      .map { File(dir, it) }
+                      .firstOrNull()
+          """, """        // list() returns null when the directory can't be read (e.g. no storage
+                  // access on newer Android versions); treat that as "not found"
+                  val matches = dir.list { _, fileName -> fileName.toLowerCase() == nameLower }
+                      ?: return null
+                  return matches
+                      .map { File(dir, it) }
+                      .firstOrNull()
+          """),
+          ])
+
+          # ---------------------------------------------------------------- unused update checker
+          mp = pathlib.Path(JAVA + "ui/activity/MainActivity.kt")
+          text = mp.read_text()
+          text, n = re.subn(r"^import com\.github\.javiersantos\.appupdater.*\n", "", text, flags=re.M)
+          if n != 3:
+              raise SystemExit("Expected 3 AppUpdater imports, found %d" % n)
+          mp.write_text(text)
+
+          # ---------------------------------------------------------------- Gradle files
+          edit("build.gradle", [
+              ("""    repositories {
+                  jcenter()
+                  google()
+                  maven {
+                      url 'https://maven.google.com/'
+                      name 'Google'
+                  }
+              }""", """    repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+                  jcenter()
+              }"""),
+              ("""        google()
+                  maven { url "https://jitpack.io" }
+          """, """        google()
+                  mavenCentral()
+          """),
+          ])
+
+          edit("app/build.gradle", [
+              ("    implementation 'com.github.codekidX:storage-chooser:2.0.4.4'\n\n", ""),
+              ("    implementation 'com.github.javiersantos:AppUpdater:2.7'\n\n", ""),
+              ('    implementation "org.jetbrains.anko:anko-sqlite:$anko_version"\n', ""),
+              ("""repositories {
+              jcenter()
+              maven {
+                  url "https://jitpack.io"
+              }
+          }""", """repositories {
+              mavenCentral()
+              jcenter()
+          }"""),
+              ("    compileSdkVersion 28\n",
+               "    compileSdkVersion 28\n\n    packagingOptions {\n        pickFirst '**/*.so'\n    }\n"),
+          ])
+
+          print("All changes applied")
+          PY
+
+      - name: Build the APK
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain assembleMainlineDebug 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Show a short error summary
+        if: failure()
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          {
+            echo '### Build error (send a screenshot of this to Claude)'
+            echo '```'
+            if [ -f "$LOG" ]; then
+              grep -E '^e: ' "$LOG" | head -n 30 || true
+              if grep -q 'What went wrong' "$LOG"; then
+                grep -A 25 'What went wrong' "$LOG" | head -n 40
+              else
+                tail -n 40 "$LOG"
+              fi
+            else
+              echo 'The build did not start. Open the failed step above and check its last lines.'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tesa-fixed-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
